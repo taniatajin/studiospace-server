@@ -183,7 +183,172 @@ async function run() {
 
     // ===== BOOKINGS ROUTES =====
 
+    // Overlap logic: existing.start < new.end AND existing.end > new.start
+    const findConfirmedOverlap = (
+      studioId: string,
+      date: string,
+      start: number,
+      end: number,
+      excludeId?: ObjectId
+    ) => {
+      const filter: any = {
+        studioId,
+        date,
+        status: "Confirmed",
+        startHour: { $lt: end },
+        endHour: { $gt: start },
+      };
+      if (excludeId) filter._id = { $ne: excludeId };
+      return bookingsCollection.findOne(filter);
+    };
+
+    // Booking modal e dekhanor jonno: oi din e kon slot confirmed
+    app.get("/bookings/availability", async (req, res) => {
+      const { studioId, date } = req.query as Record<string, string>;
+      if (!studioId || !date) {
+        return res.status(400).json({ message: "studioId and date are required" });
+      }
+      const slots = await bookingsCollection
+        .find({ studioId, date, status: "Confirmed" })
+        .project({ startHour: 1, endHour: 1, _id: 0 })
+        .toArray();
+      res.json(slots);
+    });
+
+    app.post("/bookings", requireAuth, async (req, res) => {
+      const { studioId, date, startHour, endHour, note } = req.body;
+      const start = Number(startHour);
+      const end = Number(endHour);
+
+      if (!ObjectId.isValid(String(studioId)) || !date || Number.isNaN(start) || Number.isNaN(end)) {
+        return res.status(400).json({ message: "Invalid booking data" });
+      }
+      if (start < 0 || end > 24 || end <= start) {
+        return res.status(400).json({ message: "End time must be after the start time" });
+      }
+
+      const studio = await studiosCollection.findOne({ _id: new ObjectId(String(studioId)) });
+      if (!studio) return res.status(404).json({ message: "Studio not found" });
+      if (studio.ownerEmail === req.user!.email) {
+        return res.status(400).json({ message: "You cannot book your own studio" });
+      }
+
+      // Challenge 2: Confirmed booking er sathe time overlap check
+      const clash = await findConfirmedOverlap(String(studioId), date, start, end);
+      if (clash) {
+        return res.status(409).json({
+          message: `This slot overlaps a confirmed booking (${clash.startHour}:00 to ${clash.endHour}:00). Please choose another time.`,
+        });
+      }
+
+      const hours = end - start;
+      const doc = {
+        studioId: String(studioId),
+        studioTitle: studio.title,
+        studioImage: studio.image,
+        hostEmail: studio.ownerEmail,
+        userEmail: req.user!.email,
+        userName: req.user!.name,
+        date,
+        startHour: start,
+        endHour: end,
+        hours,
+        totalPrice: hours * studio.hourlyRate + (studio.securityDeposit || 0),
+        note: note || "",
+        status: "Pending",
+        createdAt: new Date(),
+      };
+      const result = await bookingsCollection.insertOne(doc);
+      res.status(201).json({ insertedId: result.insertedId });
+    });
+
+    app.get("/bookings/my", requireAuth, async (req, res) => {
+      const list = await bookingsCollection
+        .find({ userEmail: req.user!.email })
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(list);
+    });
+
+    // Booker nijer Pending booking cancel korte parbe
+    app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
+      const id = String(req.params.id);
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid booking id" });
+      }
+      const _id = new ObjectId(id);
+      const booking = await bookingsCollection.findOne({ _id });
+      if (!booking) return res.status(404).json({ message: "Booking not found" });
+      if (booking.userEmail !== req.user!.email) {
+        return res.status(403).json({ message: "This is not your booking" });
+      }
+      if (booking.status !== "Pending") {
+        return res.status(400).json({ message: "Only pending bookings can be cancelled" });
+      }
+      await bookingsCollection.updateOne({ _id }, { $set: { status: "Cancelled" } });
+      res.json({ message: "Booking cancelled" });
+    });
+
+    // Host er studio gulor shob booking
+    app.get("/bookings/host", requireAuth, async (req, res) => {
+      const list = await bookingsCollection
+        .find({ hostEmail: req.user!.email })
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json(list);
+    });
+
+    // Host status bodlabe: Confirmed / Completed / Cancelled
+    app.patch("/bookings/:id/status", requireAuth, async (req, res) => {
+      const { status } = req.body;
+      if (!["Confirmed", "Completed", "Cancelled"].includes(status)) {
+        return res.status(400).json({ message: "Invalid status" });
+      }
+      const id = String(req.params.id);
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid booking id" });
+      }
+      const _id = new ObjectId(id);
+      const booking = await bookingsCollection.findOne({ _id });
+      if (!booking) return res.status(404).json({ message: "Booking not found" });
+      if (booking.hostEmail !== req.user!.email) {
+        return res.status(403).json({ message: "Only the host can change this booking" });
+      }
+
+      if (status === "Confirmed") {
+        const clash = await findConfirmedOverlap(
+          booking.studioId,
+          booking.date,
+          booking.startHour,
+          booking.endHour,
+          _id
+        );
+        if (clash) {
+          return res.status(409).json({ message: "Cannot confirm: this overlaps another confirmed booking" });
+        }
+      }
+      await bookingsCollection.updateOne({ _id }, { $set: { status } });
+      res.json({ message: `Booking ${status.toLowerCase()}` });
+    });
+
     // ===== WISHLIST ROUTES =====
+
+    app.get("/wishlist", requireAuth, async (req, res) => {
+      const items = await wishlistCollection.find({ userEmail: req.user!.email }).toArray();
+      res.json(items.map((i) => i.studioId));
+    });
+
+    // Toggle: save na thakle save, thakle remove
+    app.post("/wishlist/:studioId", requireAuth, async (req, res) => {
+      const filter = { userEmail: req.user!.email, studioId: String(req.params.studioId) };
+      const existing = await wishlistCollection.findOne(filter);
+      if (existing) {
+        await wishlistCollection.deleteOne(filter);
+        return res.json({ saved: false });
+      }
+      await wishlistCollection.insertOne({ ...filter, createdAt: new Date() });
+      res.json({ saved: true });
+    });
 
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. Successfully connected to MongoDB!");
