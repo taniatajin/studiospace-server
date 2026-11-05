@@ -12,6 +12,13 @@ app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
+// Vercel e proti cold start e MongoDB connect hoye route ready hobar por-i request handle korbo
+let ready: Promise<void> = Promise.resolve();
+app.use(async (_req, _res, next) => {
+  await ready;
+  next();
+});
+
 // ---------- JWT middleware (token HTTPOnly cookie theke ashbe) ----------
 type AuthUser = { email: string; name: string };
 
@@ -352,13 +359,23 @@ async function run() {
       res.json({ saved: true });
     });
 
+    // ===== 404 ar error handler (shob route er por thakte hobe) =====
+    app.use((_req: Request, res: Response) => {
+      res.status(404).json({ message: "Route not found" });
+    });
+
+    app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+      console.error(err);
+      res.status(500).json({ message: "Internal server error" });
+    });
+
     await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. Successfully connected to MongoDB!");
   } catch (error) {
     console.error("MongoDB connection error:", error);
   }
 }
-run();
+ready = run();
 
 app.get("/", (_req, res) => {
   res.json({ message: "StudioSpace API is running" });
