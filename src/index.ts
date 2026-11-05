@@ -246,6 +246,8 @@ async function run() {
         studioId: String(studioId),
         studioTitle: studio.title,
         studioImage: studio.image,
+        hourlyRate: studio.hourlyRate,
+        securityDeposit: studio.securityDeposit || 0,
         hostEmail: studio.ownerEmail,
         userEmail: req.user!.email,
         userName: req.user!.name,
